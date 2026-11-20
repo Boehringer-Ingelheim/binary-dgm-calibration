@@ -1,0 +1,392 @@
+---
+title: "User Guide: Structure-Preserving Calibration of Binary-Outcome DGMs"
+author: "Jannik Hammerschmied, Christian Stock, and Martin Schnuerch<br> Boehringer Ingelheim Pharma GmbH & Co. KG"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: false
+    code-overflow: wrap
+execute:
+  echo: true
+  warning: false
+  message: false
+  freeze: false
+editor: source
+---
+
+::: {.callout-note title="Use of AI assistance"}
+
+Microsoft Copilot was used to assist with annotating the R code and drafting this user guide. The underlying methodology and implementation were developed by the authors, who reviewed and take responsibility for the final materials.
+
+:::
+
+
+## Purpose
+
+This guide demonstrates how to use the R functions created to implement the structure-preserving calibration algorithm developed in the paper "Quantifying and calibrating precision gain from covariate adjustment in clinical trials with binary endpoints" (Hammerschmied, Stock, & Schnuerch, 2026). 
+The purpose of these functions is to construct a structure-preserving path of binary-outcome data-generating mechanisms (DGMs). Along this path, the directions of the arm-specific linear predictors remain fixed, while their common scale is varied. The arm-specific intercepts are recalibrated at every point so that the prespecified marginal risks remain unchanged.
+
+The path is indexed by the **control-arm relative marginal prognostic strength (MPS)**. For every point on the path, the functions compute:
+
+- the control-arm and treatment-arm relative MPS;
+- the common scaling parameter $\lambda$ and both calibrated intercepts;
+- the precision-gain potential (PGP) for the risk difference, risk ratio, and marginal odds ratio; and
+- optionally, the PGP for other differentiable marginal estimands supplied by the user.
+
+The worked example below reproduces the illustrative example described in the paper.
+
+
+## Illustrative Example
+
+### Load the functions
+
+The function definitions are kept in a separate R script. `source()` evaluates that script and makes its functions available in the current R session. Make sure that the R script is stored in your current working directory.
+
+```{r}
+#| label: source-functions
+source("calibration_procedure_functions.R")
+```
+
+The main functions for applications are:
+
+- `calibration_path()`: construct a finite grid along the calibration path;
+- `plot_calibration_path()`: plot arm-specific MPS and estimand-specific PGP;
+- `select_dgm()`: recalibrate exactly at a selected control-arm MPS.
+
+The remaining functions are helpers called internally by these three functions.
+
+#### Step 2: Create the reference sample and feature matrix
+
+The algorithm uses a reference sample to approximate expectations over the covariate distribution. For reproducibility, the example fixes the random-number seed and draws a large sample of size $N=200{,}000$.
+
+The feature matrix `h` contains the evaluated covariate functions used in the arm-specific linear predictors. Its columns need not be limited to raw covariates. Here they consist of a binary covariate, a continuous covariate, and the nonlinear combination $X_1X_2^2$.
+
+```{r}
+#| label: reference-sample
+set.seed(2026)
+N <- 200000
+
+X1 <- rbinom(N, 1, 0.30)
+X2 <- rnorm(N)
+
+h <- cbind(
+  X1 = X1,
+  X2 = X2,
+  X1_X2_sq = X1 * X2^2
+)
+
+dim(h)
+head(h)
+```
+
+Each row of `h` represents one observation, and each column represents one feature. For reliable matrix multiplication, the names and ordering of `v_hom` and `v_het` below should agree with the columns of `h`.
+
+### Specify the coefficient directions
+
+The two coefficient vectors define the qualitative arm-specific risk structure:
+
+- `v_hom` is the component shared by both treatment arms;
+- `v_het` is the treatment-arm deviation from that shared component.
+
+Thus, before multiplication by the common scale $\lambda$, the control-arm score is
+
+$$
+\eta_0 = h v_{\mathrm{hom}},
+$$
+
+and the treatment-arm score is
+
+$$
+\eta_1 = h (v_{\mathrm{hom}} + v_{\mathrm{het}}).
+$$
+
+```{r}
+#| label: coefficient-directions
+v_hom <- c(
+  X1 = 0.60,
+  X2 = 0.40,
+  X1_X2_sq = 0.25
+)
+
+v_het <- c(
+  X1 = 0.0,
+  X2 = -1.1,
+  X1_X2_sq = 0.0
+)
+
+v_hom
+v_het
+```
+
+In this example, treatment-effect heterogeneity on the logit scale acts through `X2`: the coefficient direction for `X2` changes from $0.4$ under control to $0.4-1.1=-0.7$ under treatment.
+
+### Specify the marginal risks and allocation probability
+
+The marginal risks are fixed at
+
+$$
+\mu_0 = 0.55 \quad\text{and}\quad \mu_1 = 0.15.
+$$
+
+The treatment-allocation probability is $\pi=0.50$. At every point on the calibration path, the algorithm recalibrates the arm-specific intercepts so that the empirical means of the conditional risks remain equal to `mu0` and `mu1`.
+
+```{r}
+#| label: marginal-risks
+mu0 <- 0.55
+mu1 <- 0.15
+pi <- 0.50
+```
+
+### Optionally define additional estimands
+
+The implementation always evaluates the marginal risk difference (`RD`), risk ratio (`RR`), and odds ratio (`OR`). Additional differentiable marginal estimands can be supplied through a named list.
+
+Each entry must contain a function called `gradient`. It receives the arguments `mu1` and `mu0`, in that order, and must return
+
+$$
+\left(
+\frac{\partial f}{\partial \mu_1},
+\frac{\partial f}{\partial \mu_0}
+\right).
+$$
+
+The optional `label` is used in plots. Here, the log risk ratio is added as an illustration.
+
+```{r}
+#| label: additional-estimands
+additional_estimands <- list(
+  log_RR = list(
+    label = "Log risk ratio",
+    gradient = function(mu1, mu0) {
+      c(1 / mu1, -1 / mu0)
+    }
+  )
+)
+```
+
+Set `additional_estimands = NULL` in `calibration_path()` if only RD, RR, and OR are required.
+
+### Construct the calibration path
+
+`calibration_path()` first forms the two arm-specific scores. It then approximates the limiting control-arm MPS and evaluates `K` equally spaced points between zero and `t` times that limiting value.
+
+In this example:
+
+- `t = 0.95` displays the path up to 95% of the empirical limiting control-arm MPS;
+- `K = 100` uses 100 grid points;
+- `additional_estimands` adds the log risk ratio to the three default estimands.
+
+```{r}
+#| label: construct-path
+#| cache: true
+basis <- calibration_path(
+  h = h,
+  v_hom = v_hom,
+  v_het = v_het,
+  mu0 = mu0,
+  mu1 = mu1,
+  pi = pi,
+  t = 0.95,
+  K = 100,
+  additional_estimands = additional_estimands
+)
+```
+
+The returned object `basis` stores both the finite display grid and everything needed for plotting or exact recalibration. The central component is `basis$path`, with one row per grid point.
+
+```{r}
+#| label: inspect-path
+names(basis)
+head(basis$path)
+```
+
+Its columns are:
+
+- `control_mps`: relative MPS in the control arm;
+- `treatment_mps`: relative MPS in the treatment arm at the same $\lambda$;
+- `lambda`: common scale applied to both arm-specific scores;
+- `alpha0` and `alpha1`: intercepts preserving `mu0` and `mu1`;
+- one PGP column for each requested estimand.
+
+The numerical values are stored as proportions. For example, `control_mps = 0.20` represents 20% relative MPS.
+
+### Plot the calibration path
+
+The following call reproduces the paper's calibration-path figure for RD, RR, and OR. The horizontal and vertical quantities are converted to percentages by the plotting function.
+
+```{r}
+#| label: calibration-figure
+#| fig-cap: "Structure-preserving calibration path for the worked example."
+#| fig-width: 8
+#| fig-height: 6
+plot_calibration_path(
+  basis,
+  show_estimands = c("RD", "RR", "OR")
+)
+```
+
+The solid blue curve is treatment-arm relative MPS. The colored curves are the estimand-specific PGP values. The dashed identity line indicates where treatment-arm and control-arm MPS are equal.
+
+To additionally save the figure as a PDF, supply a filename:
+
+```{r}
+#| label: save-pdf
+#| eval: false
+plot_calibration_path(
+  basis,
+  file = "structure_preserving_calibration_path.pdf",
+  show_estimands = c("RD", "RR", "OR")
+)
+```
+
+
+### Export the finite grid
+
+The entire path can be written to a CSV file for further inspection or use in another program.
+
+```{r}
+#| label: export-grid
+#| eval: false
+write.csv(
+  basis$path,
+  "structure_preserving_calibration_path.csv",
+  row.names = FALSE
+)
+```
+
+
+### Select a DGM at a target control-arm MPS
+
+Suppose the desired control-arm relative MPS is 0.20. `select_dgm()` recalibrates the DGM exactly at that value. It does not select the nearest grid row or interpolate between grid points, so the result is independent of `K`.
+
+```{r}
+#| label: select-dgm
+selected_dgm <- select_dgm(
+  basis,
+  target_mps0 = 0.20
+)
+```
+
+The selected object contains the achieved arm-specific MPS values, the common scale, both calibrated intercepts, PGP for all requested estimands, and the scaled coefficient components.
+
+```{r}
+#| label: selected-summary
+selected_summary <- c(
+  control_mps = selected_dgm$control_mps,
+  treatment_mps = selected_dgm$treatment_mps,
+  lambda = selected_dgm$lambda,
+  alpha0 = selected_dgm$alpha0,
+  alpha1 = selected_dgm$alpha1,
+  selected_dgm$pgp
+)
+
+round(selected_summary, 4)
+```
+
+The coefficient vectors defining the selected DGM are:
+
+```{r}
+#| label: selected-coefficients
+selected_dgm$beta_hom
+selected_dgm$beta_het
+
+# Treatment-arm coefficient vector:
+selected_dgm$beta_hom + selected_dgm$beta_het
+```
+
+For a reference-sample row with feature vector $h_i$, the selected arm-specific conditional risks are therefore
+
+$$
+\operatorname{expit}\!\left(\alpha_0 + h_i^\top\beta_{\mathrm{hom}}\right)
+$$
+
+under control and
+
+$$
+\operatorname{expit}\!\left(\alpha_1 + h_i^\top[\beta_{\mathrm{hom}}+\beta_{\mathrm{het}}]\right)
+$$
+
+under treatment.
+
+The selected value can also be marked on the displayed path:
+
+```{r}
+#| label: selected-figure
+#| fig-cap: "Calibration path with the selected control-arm MPS marked at 20%."
+#| fig-width: 8
+#| fig-height: 6
+plot_calibration_path(
+  basis,
+  show_estimands = c("RD", "RR", "OR"),
+  selected_mps = 0.20
+)
+```
+
+## Minimal Template
+
+In general terms, for an application, the essential workflow is:
+
+```{r}
+#| label: minimal-template
+#| eval: false
+source("calibration_procedure_functions.R")
+
+# 1. Supply an N x p reference-sample feature matrix.
+h <- ...
+
+# 2. Supply two length-p coefficient-direction vectors.
+v_hom <- ...
+v_het <- ...
+
+# 3. Choose marginal risks and the treatment-allocation probability.
+mu0 <- ...
+mu1 <- ...
+pi <- ...
+
+# 4. Construct the finite calibration path.
+basis <- calibration_path(
+  h = h,
+  v_hom = v_hom,
+  v_het = v_het,
+  mu0 = mu0,
+  mu1 = mu1,
+  pi = pi,
+  t = 0.95,
+  K = 100,
+  additional_estimands = NULL
+)
+
+# 5. Inspect or plot the path.
+head(basis$path)
+plot_calibration_path(basis)
+
+# 6. Recalibrate exactly at a selected control-arm MPS.
+selected_dgm <- select_dgm(basis, target_mps0 = ...)
+```
+
+Before applying the template, ensure that:
+
+1. `h` is numeric and has one column per coefficient;
+2. `v_hom` and `v_het` have the same length and ordering as the columns of `h`;
+3. the control-arm score `h %*% v_hom` is nonconstant;
+4. `mu0`, `mu1`, and `pi` lie strictly between 0 and 1; and
+5. the selected control-arm MPS lies within the displayed range, from zero to `basis$t * basis$s0_infinity`.
+
+<br>
+
+---
+
+<br>
+
+::: {.callout-important title="Disclaimer and Terms of Use"}
+
+Every effort has been made to ensure that the information, methods, and code provided in this user guide are accurate and reliable. Nevertheless, they are provided without any warranty, including any guarantee of correctness, completeness, fitness for a particular purpose, or suitability for a specific application. The authors accept no responsibility or liability for any errors or omissions, or for any consequences arising from the use of this material. Users remain responsible for verifying the results and assessing their appropriateness for the intended application.
+
+The material may be used and shared free of charge, provided that appropriate credit is given to the authors.
+
+Questions, comments, and reports of potential errors are welcome. Please contact Martin Schnuerch at [martin.schnuerch@boehringer-ingelheim.com](mailto:martin.schnuerch@boehringer-ingelheim.com).
+
+:::
